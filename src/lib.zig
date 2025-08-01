@@ -84,22 +84,42 @@ pub fn encode(
     if (raw.desc.width > max_pixels / raw.desc.height)
         return EncodeError.ImageTooBig;
 
+    const max_size = raw.desc.width * raw.desc.height *
+        (@intFromEnum(raw.desc.channels) + 1) + header_size + padding.len;
+    const bytes = try allocator.alloc(u8, max_size);
+    defer allocator.free(bytes);
+
+    var writer = std.io.fixedBufferStream(bytes);
+    encodeInto(writer.writer(), raw) catch unreachable;
+
+    return try allocator.dupe(u8, writer.getWritten());
+}
+
+pub fn encodeInto(
+    writer: anytype,
+    raw: RawImage,
+) (EncodeError || @TypeOf(writer).Error)!void {
+    if (raw.desc.width == 0 or raw.desc.height == 0)
+        return EncodeError.ZeroSize;
+
+    if (raw.desc.channels != .rgb and raw.desc.channels != .rgba)
+        return EncodeError.InvalidChannels;
+
+    if (raw.desc.width > max_pixels / raw.desc.height)
+        return EncodeError.ImageTooBig;
+
     var index: [64]Rgba = [1]Rgba{.{ .val = 0 }} ** 64;
     var prev: Rgba = .{ .rgba = .{} };
     var cur = prev;
-    var cursor: usize = 0;
     var run_length: u8 = 0;
 
     const pixel_count = raw.desc.width * raw.desc.height;
-    const max_size = raw.desc.width * raw.desc.height * (@intFromEnum(raw.desc.channels) + 1) +
-        header_size + padding.len;
-    const bytes = try allocator.alloc(u8, max_size);
 
-    write(bytes, &cursor, magic);
-    write(bytes, &cursor, raw.desc.width);
-    write(bytes, &cursor, raw.desc.height);
-    write(bytes, &cursor, @intFromEnum(raw.desc.channels));
-    write(bytes, &cursor, @intFromEnum(raw.desc.color_space));
+    try write(writer, magic);
+    try write(writer, raw.desc.width);
+    try write(writer, raw.desc.height);
+    try write(writer, @intFromEnum(raw.desc.channels));
+    try write(writer, @intFromEnum(raw.desc.color_space));
 
     for (0..pixel_count) |pixel_index| {
         const r_index = pixel_index * @intFromEnum(raw.desc.channels);
@@ -113,30 +133,30 @@ pub fn encode(
         if (cur.val == prev.val) {
             run_length += 1;
             if (run_length == 62 or pixel_index + 1 == pixel_count) {
-                write(bytes, &cursor, ops.run | (run_length - 1));
+                try write(writer, ops.run | (run_length - 1));
                 run_length = 0;
             }
             continue;
         }
 
         if (run_length > 0) {
-            write(bytes, &cursor, ops.run | (run_length - 1));
+            try write(writer, ops.run | (run_length - 1));
             run_length = 0;
         }
 
         const cur_hash = cur.hash();
         if (index[cur_hash].val == cur.val) {
-            write(bytes, &cursor, ops.index | cur_hash);
+            try write(writer, ops.index | cur_hash);
             continue;
         }
         index[cur_hash] = cur;
 
         if (cur.rgba.a != prev.rgba.a) {
-            write(bytes, &cursor, ops.rgba);
-            write(bytes, &cursor, cur.rgba.r);
-            write(bytes, &cursor, cur.rgba.g);
-            write(bytes, &cursor, cur.rgba.b);
-            write(bytes, &cursor, cur.rgba.a);
+            try write(writer, ops.rgba);
+            try write(writer, cur.rgba.r);
+            try write(writer, cur.rgba.g);
+            try write(writer, cur.rgba.b);
+            try write(writer, cur.rgba.a);
             continue;
         }
 
@@ -148,7 +168,7 @@ pub fn encode(
             diff_g >= -2 and diff_g < 2 and
             diff_b >= -2 and diff_b < 2)
         {
-            write(bytes, &cursor, ops.diff |
+            try write(writer, ops.diff |
                 (@as(u8, @intCast(diff_r + 2)) << 4) |
                 (@as(u8, @intCast(diff_g + 2)) << 2) |
                 @as(u8, @intCast(diff_b + 2)));
@@ -162,29 +182,27 @@ pub fn encode(
             diff_g >= -32 and diff_g < 32 and
             diff_gb >= -8 and diff_gb < 8)
         {
-            write(bytes, &cursor, ops.luma |
+            try write(writer, ops.luma |
                 @as(u8, @intCast(diff_g + 32)));
-            write(bytes, &cursor, (@as(u8, @intCast(diff_gr + 8)) << 4) |
+            try write(writer, (@as(u8, @intCast(diff_gr + 8)) << 4) |
                 @as(u8, @intCast(diff_gb + 8)));
             continue;
         }
 
-        write(bytes, &cursor, ops.rgb);
-        write(bytes, &cursor, cur.rgba.r);
-        write(bytes, &cursor, cur.rgba.g);
-        write(bytes, &cursor, cur.rgba.b);
+        try write(writer, ops.rgb);
+        try write(writer, cur.rgba.r);
+        try write(writer, cur.rgba.g);
+        try write(writer, cur.rgba.b);
     }
 
-    @memcpy(bytes[cursor..][0..padding.len], padding[0..]);
-    cursor += padding.len;
-
-    return bytes;
+    try writer.writeAll(&padding);
 }
 
 pub const DecodeError = error{
     InvalidFormat,
     TooFewBytes,
     InvalidInfo,
+    InvalidMagic,
 };
 
 pub fn decode(
@@ -192,62 +210,47 @@ pub fn decode(
     bytes: QoiImage,
     decoded_format: Channels,
 ) (DecodeError || Allocator.Error)!RawImage {
-    var channels = decoded_format;
-    if (channels != .auto and channels != .rgb and channels != .rgba)
-        return DecodeError.InvalidFormat;
+    var reader = std.io.fixedBufferStream(bytes);
+    return decodeFrom(allocator, reader.reader(), decoded_format);
+}
 
-    if (bytes.len < header_size + padding.len)
-        return DecodeError.TooFewBytes;
+pub fn decodeFrom(
+    allocator: Allocator,
+    reader: anytype,
+    decoded_format: Channels,
+) (DecodeError || Allocator.Error)!RawImage {
+    if (decoded_format != .auto and decoded_format != .rgb and decoded_format != .rgba)
+        return DecodeError.InvalidFormat;
 
     var index: [64]Rgba = [1]Rgba{.{ .val = 0 }} ** 64;
     var cur: Rgba = .{ .rgba = .{} };
-    var cursor: usize = 0;
     var run_length: u8 = 0;
+    var end: bool = false;
 
-    const header_magic = read(u32, bytes, &cursor);
-    const header_width = read(u32, bytes, &cursor);
-    const header_height = read(u32, bytes, &cursor);
-    const header_channels: Channels = @enumFromInt(read(u8, bytes, &cursor));
-    const header_color_space: ColorSpace = @enumFromInt(read(u8, bytes, &cursor));
+    var desc = decodeHeaderFrom(reader) orelse
+        return DecodeError.InvalidMagic;
 
-    if (header_width == 0 or header_height == 0 or
-        (header_channels != .rgb and header_channels != .rgba) or
-        (header_color_space != .srgb and header_color_space != .linear) or
-        header_magic != magic or
-        header_width > max_pixels / header_height)
+    if (desc.width == 0 or desc.height == 0 or
+        (desc.channels != .rgb and desc.channels != .rgba) or
+        (desc.color_space != .srgb and desc.color_space != .linear) or
+        desc.width > max_pixels / desc.height)
     {
-        std.log.err(
-            \\magic = {}
-            \\header_magic = {}
-            \\header_width = {}
-            \\header_height = {}
-            \\header_channels = {}
-            \\header_color_space = {}
-        , .{
-            magic,
-            header_magic,
-            header_width,
-            header_height,
-            header_channels,
-            header_color_space,
-        });
         return DecodeError.InvalidInfo;
     }
 
-    if (channels == .auto)
-        channels = header_channels;
+    if (decoded_format != .auto)
+        desc.channels = decoded_format;
 
-    const chunk_count = bytes.len - padding.len;
-    const pixel_count = header_width * header_height;
-    const pixels = try allocator.alloc(u8, pixel_count * @intFromEnum(channels));
+    const pixel_count = desc.width * desc.height;
+    const pixels = try allocator.alloc(u8, pixel_count * @intFromEnum(desc.channels));
 
     for (0..pixel_count) |pixel_index| {
         defer {
-            const r_index = pixel_index * @intFromEnum(channels);
+            const r_index = pixel_index * @intFromEnum(desc.channels);
             pixels[r_index + 0] = cur.rgba.r;
             pixels[r_index + 1] = cur.rgba.g;
             pixels[r_index + 2] = cur.rgba.b;
-            if (channels == .rgba)
+            if (desc.channels == .rgba)
                 pixels[r_index + 3] = cur.rgba.a;
         }
 
@@ -256,18 +259,20 @@ pub fn decode(
             continue;
         }
 
-        if (cursor >= chunk_count)
-            continue;
+        if (end) continue;
 
-        const opcode = read(u8, bytes, &cursor);
+        const opcode = read(u8, reader) catch {
+            end = true;
+            continue;
+        };
         defer index[cur.hash()] = cur;
 
         if (opcode == ops.rgb or opcode == ops.rgba) {
-            cur.rgba.r = read(u8, bytes, &cursor);
-            cur.rgba.g = read(u8, bytes, &cursor);
-            cur.rgba.b = read(u8, bytes, &cursor);
+            cur.rgba.r = try read(u8, reader);
+            cur.rgba.g = try read(u8, reader);
+            cur.rgba.b = try read(u8, reader);
             if (opcode == ops.rgba)
-                cur.rgba.a = read(u8, bytes, &cursor);
+                cur.rgba.a = try read(u8, reader);
             continue;
         }
 
@@ -284,7 +289,7 @@ pub fn decode(
         }
 
         if ((opcode & ops.mask) == ops.luma) {
-            const extra = read(u8, bytes, &cursor);
+            const extra = try read(u8, reader);
             const diff_g: u8 = (opcode & 0x3f) -% 32;
             cur.rgba.r +%= diff_g -% 8 +% ((extra >> 4) & 0xf);
             cur.rgba.g +%= diff_g;
@@ -300,40 +305,58 @@ pub fn decode(
 
     return .{
         .pixels = pixels,
-        .desc = .{
-            .width = header_width,
-            .height = header_height,
-            .channels = channels,
-            .color_space = header_color_space,
-        },
+        .desc = desc,
+    };
+}
+
+pub fn decodeHeader(bytes: []const u8) ?Description {
+    var reader = std.io.fixedBufferStream(bytes);
+    return decodeHeaderFrom(reader.reader());
+}
+
+pub fn decodeHeaderFrom(reader: anytype) ?Description {
+    const header_magic = try read(u32, reader);
+    const header_width = try read(u32, reader);
+    const header_height = try read(u32, reader);
+    const header_channels: Channels = @enumFromInt(try read(u8, reader));
+    const header_color_space: ColorSpace = @enumFromInt(try read(u8, reader));
+
+    if (header_magic != magic) return null;
+
+    return .{
+        .width = header_width,
+        .height = header_height,
+        .channels = header_channels,
+        .color_space = header_color_space,
     };
 }
 
 fn write(
-    bytes: []u8,
-    cursor: *usize,
+    writer: anytype,
     val: anytype,
-) void {
+) @TypeOf(writer).Error!void {
     const T = @TypeOf(val);
-    std.mem.writeInt(T, bytes[cursor.*..][0..@sizeOf(T)], val, .big);
-    cursor.* += @sizeOf(T);
+    var buffer: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &buffer, val, .big);
+    try writer.writeAll(&buffer);
 }
 
 fn read(
     comptime T: type,
-    bytes: []const u8,
-    cursor: *usize,
-) T {
-    defer cursor.* += @sizeOf(T);
-    return std.mem.readInt(T, bytes[cursor.*..][0..@sizeOf(T)], .big);
+    reader: anytype,
+) @TypeOf(reader).Error!T {
+    var buffer: [@sizeOf(T)]u8 = undefined;
+    _ = try reader.readAll(&buffer);
+    return std.mem.readInt(T, &buffer, .big);
 }
 
-// pub export fn encodeInto(
-//     writer: anytype,
-//     raw: RawImage,
-// ) @TypeOf(writer).Error!usize {}
+fn saveTestResult(qoi: []const u8, comptime identifier: []const u8) !void {
+    const file = try std.fs.cwd().createFile("failed_test_" ++ identifier ++ ".qoi", .{});
+    defer file.close();
+    try file.writeAll(qoi);
+}
 
-test {
+test "round trip" {
     try testing.fuzz({}, struct {
         fn testOne(_: void, input: []const u8) anyerror!void {
             if (input.len < 2) return;
@@ -358,11 +381,7 @@ test {
             });
             defer testing.allocator.free(qoi);
 
-            {
-                const file = std.fs.cwd().createFile("failed_test.qoi", .{}) catch unreachable;
-                file.writeAll(qoi) catch unreachable;
-                file.close();
-            }
+            errdefer saveTestResult(qoi, "round_trip") catch {};
 
             const round_trip_data = try decode(testing.allocator, qoi, .rgba);
             defer testing.allocator.free(round_trip_data.pixels);
@@ -372,6 +391,35 @@ test {
             try testing.expectEqual(desc.channels, round_trip_data.desc.channels);
             try testing.expectEqual(desc.color_space, round_trip_data.desc.color_space);
             try testing.expectEqualSlices(u8, full_data, round_trip_data.pixels);
+        }
+    }.testOne, .{});
+}
+
+test "decode garbage" {
+    try testing.fuzz({}, struct {
+        fn testOne(_: void, _input: []const u8) anyerror!void {
+            if (_input.len < 14) return;
+
+            const input = try testing.allocator.dupe(u8, _input);
+            defer testing.allocator.free(input);
+
+            const width = input[0];
+            const height = input[0];
+
+            // write a fake qoi header to speed up fuzzing
+            var writer = std.io.fixedBufferStream(input[0..]);
+            try write(writer.writer(), @as(u32, magic));
+            try write(writer.writer(), @as(u32, width));
+            try write(writer.writer(), @as(u32, height));
+            try write(writer.writer(), @as(u8, 3));
+            try write(writer.writer(), @as(u8, 0));
+
+            const img = decode(testing.allocator, input, .auto) catch {
+                return;
+            };
+            defer testing.allocator.free(img.pixels);
+
+            // saveTestResult(input, "garbage") catch {};
         }
     }.testOne, .{});
 }
