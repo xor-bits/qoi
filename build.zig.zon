@@ -2,7 +2,7 @@
     .name = .qoi,
     .version = "0.0.1",
     .fingerprint = 0x7c7975e1b58a6d8a,
-    .minimum_zig_version = "0.14.1",
+    .minimum_zig_version = "0.15.0",
     .dependencies = .{},
     .paths = .{"."},
 }
