@@ -40,6 +40,9 @@ const Rgba = extern union {
     },
     val: u32,
 
+    const zero: Rgba = .{ .val = 0 };
+    const black: Rgba = .{ .rgba = .{} };
+
     fn hash(self: @This()) u6 {
         return @intCast((self.rgba.r *% 3 +%
             self.rgba.g *% 5 +%
@@ -87,16 +90,12 @@ pub fn encode(
     raw: RawImage,
 ) (EncodeError || Allocator.Error)!QoiImage {
     try checkDesc(raw.desc);
-
-    const max_size = @as(usize, raw.desc.width) * raw.desc.height *
-        (@intFromEnum(raw.desc.channels) + 1) + header_size + padding.len;
-    const buffer = try allocator.alloc(u8, max_size);
-    defer allocator.free(buffer);
-
-    var writer = std.Io.Writer.fixed(buffer);
-    encodeInto(&writer, raw) catch unreachable;
-    const written = buffer.len - writer.buffer.len;
-    return try allocator.dupe(u8, buffer[0..written]);
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    encodeInto(&writer.writer, raw) catch |err| {
+        std.debug.assert(err == error.WriteFailed);
+        return error.OutOfMemory;
+    };
+    return try writer.toOwnedSlice();
 }
 
 pub fn encodeInto(
@@ -105,8 +104,8 @@ pub fn encodeInto(
 ) (EncodeError || std.Io.Writer.Error)!void {
     try checkDesc(raw.desc);
 
-    var index: [64]Rgba = [1]Rgba{.{ .val = 0 }} ** 64;
-    var prev: Rgba = .{ .rgba = .{} };
+    var index: [64]Rgba = @splat(.zero);
+    var prev: Rgba = .black;
     var cur = prev;
     var run_length: u8 = 0;
 
@@ -115,11 +114,11 @@ pub fn encodeInto(
     try write(writer, magic);
     try write(writer, raw.desc.width);
     try write(writer, raw.desc.height);
-    try write(writer, @intFromEnum(raw.desc.channels));
-    try write(writer, @intFromEnum(raw.desc.color_space));
+    try write(writer, @backingInt(raw.desc.channels));
+    try write(writer, @backingInt(raw.desc.color_space));
 
     for (0..pixel_count) |pixel_index| {
-        const r_index = pixel_index * @intFromEnum(raw.desc.channels);
+        const r_index = pixel_index * @backingInt(raw.desc.channels);
         cur.rgba.r = raw.pixels[r_index + 0];
         cur.rgba.g = raw.pixels[r_index + 1];
         cur.rgba.b = raw.pixels[r_index + 2];
@@ -219,8 +218,8 @@ pub fn decodeFrom(
     if (decoded_format != .auto and decoded_format != .rgb and decoded_format != .rgba)
         return DecodeError.InvalidFormat;
 
-    var index: [64]Rgba = [1]Rgba{.{ .val = 0 }} ** 64;
-    var cur: Rgba = .{ .rgba = .{} };
+    var index: [64]Rgba = @splat(.zero);
+    var cur: Rgba = .black;
     var run_length: u8 = 0;
     var end: bool = false;
 
@@ -239,11 +238,11 @@ pub fn decodeFrom(
         desc.channels = decoded_format;
 
     const pixel_count = desc.width * desc.height;
-    const pixels = try allocator.alloc(u8, pixel_count * @intFromEnum(desc.channels));
+    const pixels = try allocator.alloc(u8, pixel_count * @backingInt(desc.channels));
 
     for (0..pixel_count) |pixel_index| {
         defer {
-            const r_index = pixel_index * @intFromEnum(desc.channels);
+            const r_index = pixel_index * @backingInt(desc.channels);
             pixels[r_index + 0] = cur.rgba.r;
             pixels[r_index + 1] = cur.rgba.g;
             pixels[r_index + 2] = cur.rgba.b;
@@ -315,8 +314,8 @@ pub fn decodeHeaderFrom(reader: anytype) std.Io.Reader.Error!?Description {
     const header_magic = try read(u32, reader);
     const header_width = try read(u32, reader);
     const header_height = try read(u32, reader);
-    const header_channels: Channels = @enumFromInt(try read(u8, reader));
-    const header_color_space: ColorSpace = @enumFromInt(try read(u8, reader));
+    const header_channels: Channels = @fromBackingInt(try read(u8, reader));
+    const header_color_space: ColorSpace = @fromBackingInt(try read(u8, reader));
 
     if (header_magic != magic) return null;
 

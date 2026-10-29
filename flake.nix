@@ -18,8 +18,8 @@
         devShells.default = pkgs.mkShell rec {
           buildInputs = with pkgs; [
             pkg-config
-            zig
-            zls
+            zig_0_17
+            zls_0_17
           ];
 
           LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath buildInputs}";
